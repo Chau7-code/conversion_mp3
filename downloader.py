@@ -813,7 +813,7 @@ def download_spotify_fallback(url, output_path, custom_filename=None, progress_i
 
 # ===== MUSIC RECOGNITION FUNCTIONS =====
 
-def parse_timecode(timecode_str):
+def parse_timecode(timecode_str, default_to_minutes=False):
     """Parse timecode in various formats to seconds"""
     try:
         timecode_str = timecode_str.strip()
@@ -843,9 +843,67 @@ def parse_timecode(timecode_str):
                 return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
             elif len(parts) == 2:
                 return float(parts[0]) * 60 + float(parts[1])
-        return float(timecode_str)
+        
+        val = float(timecode_str)
+        if default_to_minutes:
+            return val * 60
+        return val
     except ValueError:
         raise Exception(f"Format de timecode invalide: {timecode_str}")
+
+
+def trim_audio(input_path, output_path, start_time=None, end_time=None):
+    """Trim audio file using FFmpeg"""
+    ffmpeg_location = ensure_ffmpeg()
+    if not ffmpeg_location:
+        raise Exception("FFmpeg n'est pas disponible.")
+    
+    ffmpeg_exe = os.path.join(ffmpeg_location, 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+    
+    # -ss before -i is faster, but less accurate. 
+    # -ss after -i is accurate.
+    # Since we want to cut precise parts of a song, accuracy is important.
+    # We use re-encoding to ensure clean cuts and avoid timestamp issues.
+    
+    cmd = [ffmpeg_exe]
+    
+    if start_time is not None:
+        cmd.extend(['-ss', str(start_time)])
+        
+    cmd.extend(['-i', input_path])
+    
+    if end_time is not None:
+        # If start_time is set, -to is relative to the beginning of the file (because -ss is before -i? No wait)
+        # If -ss is BEFORE -i, it seeks input.
+        # If -ss is AFTER -i, it decodes until start.
+        
+        # Let's put -ss BEFORE -i for speed, but then -to might behave differently?
+        # Actually, if we use -ss before -i, the timestamps are reset to 0.
+        # So if we want to stop at minute 50 of the ORIGINAL, we need to calculate duration.
+        # But user says "-fin 50.00" (50th minute of the song).
+        
+        # If we use -ss before -i, we are seeking. The output stream starts at 0.
+        # So if start is 10min and end is 50min, duration is 40min.
+        # We should use -t (duration) = end - start.
+        
+        if start_time:
+            duration = end_time - start_time
+            if duration <= 0:
+                raise Exception("Le temps de fin doit être supérieur au temps de début.")
+            cmd.extend(['-t', str(duration)])
+        else:
+            cmd.extend(['-to', str(end_time)])
+            
+    cmd.extend(['-acodec', 'libmp3lame', '-ab', '192k', '-y', output_path])
+    
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not os.path.exists(output_path):
+            raise Exception(f"Fichier coupé non créé: {output_path}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr if e.stderr else str(e)
+        raise Exception(f"Erreur lors de la coupe audio: {error_msg}")
 
 
 def extract_audio_segment(input_path, output_path, start_time, duration=10):
@@ -867,15 +925,51 @@ def extract_audio_segment(input_path, output_path, start_time, duration=10):
 async def search_track_links(track_name, artist_name):
     """Search for track links on various platforms"""
     links = {}
+    spotify_uri = None
+    
+    # Try Spotify API first if credentials exist
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        client_id = os.getenv('SPOTIFY_CLIENT_ID')
+        client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+        
+        if client_id and client_secret:
+            print(f"[Spotify] Identifiants trouvés, recherche via API...")
+            import spotipy
+            from spotipy.oauth2 import SpotifyClientCredentials
+            
+            auth_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
+            sp = spotipy.Spotify(auth_manager=auth_manager)
+            
+            query = f"track:{track_name} artist:{artist_name}"
+            results = sp.search(q=query, type='track', limit=1)
+            
+            if results['tracks']['items']:
+                track = results['tracks']['items'][0]
+                links['spotify'] = track['external_urls']['spotify']
+                spotify_uri = track['uri']
+                # Add direct play link (URI)
+                links['spotify_uri'] = spotify_uri
+                print(f"[Spotify] URI trouvé: {spotify_uri}")
+            else:
+                print(f"[Spotify] Aucune piste trouvée via API pour {query}")
+        else:
+            print(f"[Spotify] Pas d'identifiants (SPOTIFY_CLIENT_ID/SECRET) dans .env")
+    except Exception as e:
+        print(f"Erreur Spotify API: {e}")
+
     try:
         ffmpeg_location = ensure_ffmpeg()
         ydl_opts = {
             'quiet': True,
-            'ffmpeg_location': ffmpeg_location, # Fix ffmpeg not found warnings
-            'extract_flat': True, # Faster search, don't need full info
+            'ffmpeg_location': ffmpeg_location,
+            'extract_flat': True,
         }
         
         search_query = f"{artist_name} {track_name}" if artist_name else track_name
+        
+        # Youtube search
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
@@ -883,11 +977,29 @@ async def search_track_links(track_name, artist_name):
                     links['youtube'] = f"https://www.youtube.com/watch?v={info['entries'][0]['id']}"
         except:
             pass
-        links['spotify'] = f"https://open.spotify.com/search/{search_query.replace(' ', '+')}"
+            
+        # Fallback Spotify search link if API failed
+        if 'spotify' not in links:
+            links['spotify'] = f"https://open.spotify.com/search/{search_query.replace(' ', '+')}"
+            
         links['soundcloud'] = f"https://soundcloud.com/search?q={search_query.replace(' ', '%20')}"
+        
     except Exception as e:
         print(f"Erreur recherche liens: {e}")
+        
     return links
+
+
+def play_spotify_uri(uri):
+    """Launch Spotify URI on local machine (Windows only)"""
+    if os.name == 'nt' and uri and uri.startswith('spotify:'):
+        try:
+            print(f"[Spotify] Lancement de {uri}...")
+            os.system(f"start {uri}")
+            return True
+        except Exception as e:
+            print(f"[Spotify] Erreur lancement: {e}")
+    return False
 
 
 def download_for_recognition(url, output_path):

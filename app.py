@@ -134,9 +134,6 @@ def download_file(file_id):
     
     # Obtenir la taille du fichier pour estimer le temps de téléchargement
     file_size = os.path.getsize(file_path)
-    # Estimer le temps de téléchargement (environ 1 Mo par seconde pour une connexion moyenne)
-    # Ajouter 30 secondes de marge de sécurité
-    estimated_download_time = max(60, (file_size / (1024 * 1024)) + 30)
     
     # Utiliser le nom du fichier passé en paramètre ou le nom du fichier sur disque
     requested_filename = request.args.get('filename')
@@ -149,22 +146,28 @@ def download_file(file_id):
     else:
         download_name = os.path.basename(file_path)
     
-    # Supprimer le fichier après l'envoi dans un thread
-    def delete_file_after_download():
-        # Attendre que le téléchargement soit terminé (temps estimé + marge)
-        time.sleep(int(estimated_download_time))
+    # Utiliser un générateur pour streamer le fichier et le supprimer à la fin
+    def generate():
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"Fichier supprimé après téléchargement: {file_path}")
-        except Exception as e:
-            print(f"Erreur lors du suppression du fichier: {e}")
-    
-    thread = threading.Thread(target=delete_file_after_download)
-    thread.daemon = True
-    thread.start()
-    
-    return send_file(file_path, as_attachment=True, download_name=download_name, mimetype=mimetype)
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(8192) # 8KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            # Cette partie s'exécute après la fin du stream (ou si le client déconnecte)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"Fichier supprimé après téléchargement: {file_path}")
+            except Exception as e:
+                print(f"Erreur lors du suppression du fichier: {e}")
+
+    response = Response(stream_with_context(generate()), mimetype=mimetype)
+    response.headers['Content-Disposition'] = f'attachment; filename="{download_name}"'
+    response.headers['Content-Length'] = file_size
+    return response
 
 @app.route('/delete/<file_id>', methods=['POST'])
 def delete_file(file_id):

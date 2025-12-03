@@ -25,7 +25,7 @@ async def on_ready():
     print(f'{bot.user} est connecté à Discord!')
 
 @bot.command(name='convert')
-async def convert(ctx, url: str):
+async def convert(ctx, url: str, *args):
     # Vérifier si l'utilisateur demande de l'aide
     if url in ['-h', '-help', '--help']:
         embed = discord.Embed(
@@ -39,7 +39,8 @@ async def convert(ctx, url: str):
             value=(
                 "• **Téléchargement direct** : Convertit les liens en fichiers MP3.\n"
                 "• **Support Playlists** : Télécharge les playlists complètes et les envoie sous forme de fichier ZIP.\n"
-                "• **Organisation** : Envoie automatiquement les fichiers dans le salon `#musique`."
+                "• **Organisation** : Envoie automatiquement les fichiers dans le salon `#musique`.\n"
+                "• **Découpage** : Utilisez `-debut` et `-fin` pour couper l'audio."
             ),
             inline=False
         )
@@ -57,13 +58,37 @@ async def convert(ctx, url: str):
         
         embed.add_field(
             name="📝 Utilisation",
-            value="`!convert <url>`",
+            value=(
+                "`!convert <url>`\n"
+                "`!convert <url> -debut 1.30 -fin 2.45` (Coupe de 1m30 à 2m45)\n"
+                "`!convert <url> -debut 10` (Commence à 10 min)"
+            ),
             inline=False
         )
         
         embed.set_footer(text="Profitez de votre musique ! 🎵")
         await ctx.send(embed=embed)
         return
+
+    # Parser les arguments de découpage
+    start_time = None
+    end_time = None
+    
+    if args:
+        for i, arg in enumerate(args):
+            if arg in ['-debut', '--start'] and i + 1 < len(args):
+                try:
+                    # default_to_minutes=True car l'utilisateur veut que "10" soit 10 minutes
+                    start_time = downloader.parse_timecode(args[i+1], default_to_minutes=True)
+                except Exception as e:
+                    await ctx.send(f"❌ Format de temps invalide pour -debut: {e}")
+                    return
+            elif arg in ['-fin', '--end'] and i + 1 < len(args):
+                try:
+                    end_time = downloader.parse_timecode(args[i+1], default_to_minutes=True)
+                except Exception as e:
+                    await ctx.send(f"❌ Format de temps invalide pour -fin: {e}")
+                    return
 
     # Vérifier si on est dans le bon channel ou rediriger
     target_channel_name = "musique"
@@ -101,6 +126,10 @@ async def convert(ctx, url: str):
         await status_msg.edit(content=f"Téléchargement en cours ({source_type})...")
 
         if downloader.is_playlist(url):
+            if start_time is not None or end_time is not None:
+                await status_msg.edit(content="❌ Le découpage n'est pas supporté pour les playlists.")
+                return
+                
             # Playlist
             zip_path, zip_filename = await loop.run_in_executor(
                 None, 
@@ -123,6 +152,24 @@ async def convert(ctx, url: str):
             
             file_path = final_path
             filename = final_filename + ".mp3"
+            
+            # Appliquer le découpage si demandé
+            if start_time is not None or end_time is not None:
+                await status_msg.edit(content="✂️ Découpage du fichier audio...")
+                trimmed_path = os.path.join(UPLOAD_FOLDER, f"{progress_id}_trimmed.mp3")
+                try:
+                    await loop.run_in_executor(None, lambda: downloader.trim_audio(file_path, trimmed_path, start_time, end_time))
+                    
+                    # Remplacer le fichier original par le fichier coupé
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    file_path = trimmed_path
+                    
+                except Exception as e:
+                    await status_msg.edit(content=f"❌ Erreur lors du découpage: {e}")
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    return
 
         # Vérifier que le fichier existe
         if not os.path.exists(file_path):
@@ -341,6 +388,20 @@ async def find_music(ctx, url: str = None, *args):
                     links_text += f"☁️ [SoundCloud]({result['links']['soundcloud']})\n"
                 if result.get('shazam_url'):
                     links_text += f"🔵 [Shazam]({result['shazam_url']})\n"
+                
+                # Tenter de lancer sur Spotify localement
+                if 'spotify_uri' in result['links']:
+                    try:
+                        # On lance dans un thread séparé pour ne pas bloquer
+                        await loop.run_in_executor(None, lambda: downloader.play_spotify_uri(result['links']['spotify_uri']))
+                        embed.set_footer(text=f"Demandé par {ctx.author.name} • 🚀 Lancé sur Spotify !")
+                    except Exception as e:
+                        print(f"Erreur lancement Spotify: {e}")
+                        embed.set_footer(text=f"Demandé par {ctx.author.name}")
+                else:
+                    embed.set_footer(text=f"Demandé par {ctx.author.name}")
+            else:
+                embed.set_footer(text=f"Demandé par {ctx.author.name}")
             
             if links_text:
                 embed.add_field(
@@ -361,8 +422,6 @@ async def find_music(ctx, url: str = None, *args):
                 value=f"{result['timecode']}s",
                 inline=True
             )
-        
-        embed.set_footer(text=f"Demandé par {ctx.author.name}")
         
         await status_msg.delete()
         await target_channel.send(f"Reconnaissance demandée par {ctx.author.mention}", embed=embed)

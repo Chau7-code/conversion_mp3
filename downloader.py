@@ -809,3 +809,252 @@ def download_spotify_fallback(url, output_path, custom_filename=None, progress_i
 
     except Exception as e:
         raise Exception(f"Erreur lors du fallback Spotify: {str(e)}")
+
+
+# ===== MUSIC RECOGNITION FUNCTIONS =====
+
+def parse_timecode(timecode_str):
+    """Parse timecode in various formats to seconds"""
+    try:
+        timecode_str = timecode_str.strip()
+        if 'h' in timecode_str.lower():
+            parts = timecode_str.lower().split('h')
+            if len(parts) == 2:
+                hours = float(parts[0])
+                minutes_part = parts[1].strip()
+                if minutes_part == '':
+                    return hours * 3600
+                elif '.' in minutes_part or ':' in minutes_part:
+                    sep = '.' if '.' in minutes_part else ':'
+                    time_parts = minutes_part.split(sep)
+                    if len(time_parts) == 2:
+                        return hours * 3600 + float(time_parts[0]) * 60 + float(time_parts[1])
+                else:
+                    return hours * 3600 + float(minutes_part) * 60
+        elif ':' in timecode_str:
+            parts = timecode_str.split(':')
+            if len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            elif len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+        elif '.' in timecode_str:
+            parts = timecode_str.split('.')
+            if len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            elif len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+        return float(timecode_str)
+    except ValueError:
+        raise Exception(f"Format de timecode invalide: {timecode_str}")
+
+
+def extract_audio_segment(input_path, output_path, start_time, duration=10):
+    """Extract audio segment using FFmpeg"""
+    ffmpeg_location = ensure_ffmpeg()
+    if not ffmpeg_location:
+        raise Exception("FFmpeg n'est pas disponible.")
+    
+    ffmpeg_exe = os.path.join(ffmpeg_location, 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+    cmd = [ffmpeg_exe, '-ss', str(start_time), '-i', input_path, '-t', str(duration), 
+           '-acodec', 'libmp3lame', '-ab', '192k', '-y', output_path]
+    
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    if not os.path.exists(output_path):
+        raise Exception(f"Fichier non créé: {output_path}")
+    return output_path
+
+
+async def search_track_links(track_name, artist_name):
+    """Search for track links on various platforms"""
+    links = {}
+    try:
+        ffmpeg_location = ensure_ffmpeg()
+        ydl_opts = {
+            'quiet': True,
+            'ffmpeg_location': ffmpeg_location, # Fix ffmpeg not found warnings
+            'extract_flat': True, # Faster search, don't need full info
+        }
+        
+        search_query = f"{artist_name} {track_name}" if artist_name else track_name
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
+                if info and 'entries' in info and len(info['entries']) > 0:
+                    links['youtube'] = f"https://www.youtube.com/watch?v={info['entries'][0]['id']}"
+        except:
+            pass
+        links['spotify'] = f"https://open.spotify.com/search/{search_query.replace(' ', '+')}"
+        links['soundcloud'] = f"https://soundcloud.com/search?q={search_query.replace(' ', '%20')}"
+    except Exception as e:
+        print(f"Erreur recherche liens: {e}")
+    return links
+
+
+def download_for_recognition(url, output_path):
+    """Download complete audio for recognition"""
+    ffmpeg_location = ensure_ffmpeg()
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_path.replace('.mp3', '.%(ext)s'),
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+        'quiet': False,
+        'ffmpeg_location': ffmpeg_location,
+        'keepvideo': False,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        print(f"[Recognition] Téléchargement audio...")
+        info = ydl.extract_info(url, download=True)
+        if os.path.exists(output_path):
+            print(f"[Recognition] Audio: {info.get('duration', 0)}s ({info.get('duration', 0)/60:.1f} min)")
+            return output_path
+        base_path = output_path.replace('.mp3', '')
+        directory = os.path.dirname(output_path)
+        files = [f for f in os.listdir(directory) if f.startswith(os.path.basename(base_path)) and f.endswith('.mp3')]
+        if files:
+            return os.path.join(directory, files[0])
+        raise Exception("MP3 non créé")
+
+
+def recognize_music_from_url_sync(url, timecodes=None, progress_id=None, progress_dict=None, keep_file=False):
+    """Sync wrapper for recognize_music_from_url"""
+    import asyncio
+    import sys
+    
+    # Fix for Windows "Event loop is closed" error
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    return asyncio.run(recognize_music_from_url(url, timecodes, progress_id, progress_dict, keep_file))
+
+
+async def recognize_music_from_url(url, timecodes=None, progress_id=None, progress_dict=None, keep_file=False):
+    """Recognize music from URL using Shazam"""
+    from shazamio import Shazam
+    temp_uuid = str(uuid.uuid4())
+    temp_audio_path = os.path.join(UPLOAD_FOLDER, f"{temp_uuid}.mp3")
+    final_path = None
+    result_to_return = {'found': False, 'message': 'Erreur inconnue'}  # Default result
+    
+    try:
+        # Determine source type
+        if is_youtube_url(url):
+            source_type = 'youtube'
+        elif is_soundcloud_url(url):
+            source_type = 'soundcloud'
+        elif is_spotify_url(url):
+            source_type = 'spotify'
+        elif is_instagram_url(url):
+            source_type = 'instagram'
+        else:
+            raise Exception("URL non supportée")
+        
+        # Download audio
+        final_path = download_for_recognition(url, temp_audio_path)
+        
+        # Default timecodes
+        if not timecodes:
+            timecodes = [30, 60, 90]
+        
+        # Analyze each timecode
+        print(f"[Recognition] Initialisation Shazam...")
+        shazam = Shazam()
+        
+        results = []
+        print(f"[Recognition] Analyse de {len(timecodes)} timecodes: {timecodes}")
+        
+        for i, timecode in enumerate(timecodes):
+            segment_path = None
+            try:
+                print(f"[Recognition] Traitement timecode {i+1}/{len(timecodes)}: {timecode}s")
+                segment_path = os.path.join(UPLOAD_FOLDER, f"{temp_uuid}_segment_{i}.mp3")
+                
+                # Extract segment
+                print(f"[Recognition] Extraction segment vers {segment_path}")
+                extract_audio_segment(final_path, segment_path, timecode, duration=10)
+                
+                # Recognize
+                print(f"[Recognition] Envoi à Shazam...")
+                result = await shazam.recognize(segment_path)
+                
+                # Cleanup segment
+                if os.path.exists(segment_path):
+                    os.remove(segment_path)
+                
+                if result and 'track' in result:
+                    track_info = result['track']
+                    title = track_info.get('title', 'Inconnu')
+                    artist = track_info.get('subtitle', 'Inconnu')
+                    print(f"[Recognition] TROUVÉ: {title} - {artist}")
+                    
+                    results.append({
+                        'timecode': timecode,
+                        'title': title,
+                        'artist': artist,
+                        'shazam_url': track_info.get('url', None),
+                        'cover_art': track_info.get('images', {}).get('coverart', None),
+                        'raw_result': result
+                    })
+                else:
+                    print(f"[Recognition] Rien trouvé au timecode {timecode}s")
+                    
+            except Exception as e:
+                print(f"[Recognition] ERREUR au timecode {timecode}s: {e}")
+                if segment_path and os.path.exists(segment_path):
+                    try:
+                        os.remove(segment_path)
+                    except:
+                        pass
+                continue
+        
+        # Prepare result
+        if not results:
+            print("[Recognition] Aucune musique trouvée.")
+            result_to_return = {'found': False, 'message': 'Aucune musique reconnue'}
+        else:
+            print(f"[Recognition] {len(results)} musiques trouvées.")
+            # If multiple results, return the list
+            # For backward compatibility, we also return the "best" (first) result fields
+            best_result = results[0]
+            
+            # Search links for ALL found tracks
+            all_tracks_links = []
+            for res in results:
+                links = await search_track_links(res['title'], res['artist'])
+                res['links'] = links
+                all_tracks_links.append(res)
+            
+            result_to_return = {
+                'found': True,
+                'results': all_tracks_links, # New field with all results
+                # Legacy fields for bot.py compatibility (uses first result)
+                'title': best_result['title'],
+                'artist': best_result['artist'],
+                'timecode': best_result['timecode'],
+                'cover_art': best_result['cover_art'],
+                'shazam_url': best_result['shazam_url'],
+                'links': all_tracks_links[0]['links']
+            }
+        
+    except Exception as e:
+        print(f"[Recognition] ERREUR GLOBALE: {e}")
+        # Clean up segments
+        for f in os.listdir(UPLOAD_FOLDER):
+            if f.startswith(temp_uuid) and '_segment_' in f:
+                try:
+                    os.remove(os.path.join(UPLOAD_FOLDER, f))
+                except:
+                    pass
+        raise e
+    finally:
+        # This executes AFTER all analyses
+        if not keep_file and final_path and os.path.exists(final_path):
+            print(f"[Recognition] Suppression: {final_path}")
+            try:
+                os.remove(final_path)
+            except Exception as e:
+                print(f"[Recognition] Erreur suppression: {e}")
+        elif keep_file and final_path and os.path.exists(final_path):
+            print(f"[Recognition] Fichier conservé: {final_path}")
+    
+    return result_to_return

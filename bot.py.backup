@@ -129,12 +129,9 @@ async def convert(ctx, url: str):
             await status_msg.edit(content=f"Erreur: Le fichier téléchargé n'a pas été trouvé: {file_path}")
             return
         
-        print(f"[DEBUG] Fichier trouvé: {file_path}")
-        
         # Vérifier la taille du fichier (limite Discord ~8MB sans nitro, on met une limite safe à 25MB pour les serveurs boostés ou on prévient)
         try:
             file_size = os.path.getsize(file_path)
-            print(f"[DEBUG] Taille du fichier: {file_size / (1024*1024):.2f} MB")
         except OSError as e:
             await status_msg.edit(content=f"Erreur lors de la lecture du fichier: {str(e)}")
             if os.path.exists(file_path):
@@ -145,43 +142,19 @@ async def convert(ctx, url: str):
         
         if file_size > limit_bytes:
             await status_msg.edit(content=f"Le fichier est trop volumineux ({file_size / (1024*1024):.2f} MB) pour être envoyé sur Discord.")
-            # Ne pas supprimer le fichier ici, laisser l'utilisateur décider
         else:
             await status_msg.edit(content="Envoi du fichier dans le salon musique...")
-            print(f"[DEBUG] Envoi vers le salon: {target_channel.name}")
-            print(f"[DEBUG] Nom du fichier: {filename}")
-            print(f"[DEBUG] Demandé par: {ctx.author.mention}")
-            
             try:
-                # Envoyer le fichier
-                sent_message = await target_channel.send(
-                    f"Conversion demandée par {ctx.author.mention}", 
-                    file=discord.File(file_path, filename=filename)
-                )
-                print(f"[DEBUG] Message envoyé avec succès! ID: {sent_message.id}")
+                await target_channel.send(f"Conversion demandée par {ctx.author.mention}", file=discord.File(file_path, filename=filename))
                 await status_msg.edit(content="Fichier envoyé avec succès !")
-            except discord.errors.HTTPException as http_error:
-                error_msg = f"Erreur HTTP lors de l'envoi: {http_error.status} - {http_error.text}"
-                print(f"[ERROR] {error_msg}")
-                await status_msg.edit(content=error_msg)
-            except discord.errors.Forbidden as forbidden_error:
-                error_msg = f"Permission refusée: Le bot n'a pas les permissions pour envoyer des fichiers dans #{target_channel.name}"
-                print(f"[ERROR] {error_msg}")
-                await status_msg.edit(content=error_msg)
             except Exception as send_error:
-                error_msg = f"Erreur lors de l'envoi du fichier: {str(send_error)}"
-                print(f"[ERROR] {error_msg}")
-                await status_msg.edit(content=error_msg)
+                await status_msg.edit(content=f"Erreur lors de l'envoi du fichier: {str(send_error)}")
 
         # Nettoyage
         if os.path.exists(file_path):
-            print(f"[DEBUG] Nettoyage du fichier: {file_path}")
             os.remove(file_path)
 
     except Exception as e:
-        print(f"[ERROR] Exception globale: {str(e)}")
-        import traceback
-        traceback.print_exc()
         await status_msg.edit(content=f"Erreur lors de la conversion : {str(e)}")
         # Nettoyage en cas d'erreur
         if 'file_path' in locals() and os.path.exists(file_path):
@@ -214,8 +187,7 @@ async def find_music(ctx, url: str = None, *args):
             name="📝 Utilisation",
             value=(
                 "`!find <url>` - Analyse aux positions par défaut (30s, 60s, 90s)\n"
-                "`!find <url> -t <timecodes>` - Analyse aux timecodes spécifiés\n"
-                "`!find <url> -no_delete` - Garde le fichier téléchargé après analyse"
+                "`!find <url> -t <timecodes>` - Analyse aux timecodes spécifiés"
             ),
             inline=False
         )
@@ -248,15 +220,9 @@ async def find_music(ctx, url: str = None, *args):
         await ctx.send(embed=embed)
         return
     
-    # Parser les arguments pour extraire les timecodes et l'option no_delete
+    # Parser les arguments pour extraire les timecodes
     timecodes = None
-    keep_file = False
-    
     if args:
-        # Chercher l'option -no_delete
-        if '-no_delete' in args or '--no-delete' in args:
-            keep_file = True
-        
         # Chercher l'option -t ou --time
         for i, arg in enumerate(args):
             if arg in ['-t', '--time'] and i + 1 < len(args):
@@ -270,102 +236,69 @@ async def find_music(ctx, url: str = None, *args):
                     return
                 break
     
-    # Vérifier si le salon #musique existe
-    target_channel_name = "musique"
-    target_channel = discord.utils.get(ctx.guild.channels, name=target_channel_name)
-    
-    if not target_channel:
-        await ctx.send(f"Le salon '{target_channel_name}' n'existe pas. Veuillez le créer.")
-        return
-    
     # Message de confirmation
     status_msg = await ctx.send(f"🔍 Analyse de l'URL : {url} ...")
     
     try:
-        # Exécuter la reconnaissance dans un thread séparé pour ne pas bloquer Discord
+        # Exécuter la reconnaissance dans un thread séparé
         loop = asyncio.get_event_loop()
         
-        await status_msg.edit(content="⬇️ Téléchargement de l'audio complet...")
+        await status_msg.edit(content="⬇️ Téléchargement de l'audio...")
         
-        # Appeler la fonction de reconnaissance dans un executor pour éviter de bloquer
-        result = await loop.run_in_executor(
-            None,
-            lambda: downloader.recognize_music_from_url_sync(url, timecodes, keep_file=keep_file)
-        )
+        # Appeler la fonction de reconnaissance
+        result = await downloader.recognize_music_from_url(url, timecodes)
         
         if not result['found']:
             await status_msg.edit(content=f"❌ {result['message']}")
             return
         
-        # Vérifier si on a plusieurs résultats
-        if 'results' in result and len(result['results']) > 1:
-            embed = discord.Embed(
-                title=f"🎵 {len(result['results'])} Musiques Identifiées !",
-                description=f"Voici les musiques trouvées aux différents timecodes :",
-                color=discord.Color.green()
-            )
-            
-            for res in result['results']:
-                links_txt = ""
-                if 'links' in res:
-                    if 'youtube' in res['links']: links_txt += f"🎥 [YouTube]({res['links']['youtube']}) "
-                    if 'spotify' in res['links']: links_txt += f"🎧 [Spotify]({res['links']['spotify']}) "
-                    if 'soundcloud' in res['links']: links_txt += f"☁️ [SoundCloud]({res['links']['soundcloud']}) "
-                if res.get('shazam_url'): links_txt += f"🔵 [Shazam]({res['shazam_url']})"
-                
-                embed.add_field(
-                    name=f"⏱️ {res['timecode']}s",
-                    value=f"**{res['title']}**\n{res['artist']}\n{links_txt}",
-                    inline=False
-                )
-        else:
-            # Cas normal (un seul résultat)
-            embed = discord.Embed(
-                title="🎵 Musique Identifiée !",
-                description=f"**{result['title']}**\npar {result['artist']}",
-                color=discord.Color.green()
-            )
-            
-            # Ajouter l'image de couverture si disponible
-            if result.get('cover_art'):
-                embed.set_thumbnail(url=result['cover_art'])
-            
-            # Ajouter les liens trouvés
-            links_text = ""
-            if 'links' in result and result['links']:
-                if 'youtube' in result['links']:
-                    links_text += f"🎥 [YouTube]({result['links']['youtube']})\n"
-                if 'spotify' in result['links']:
-                    links_text += f"🎧 [Spotify]({result['links']['spotify']})\n"
-                if 'soundcloud' in result['links']:
-                    links_text += f"☁️ [SoundCloud]({result['links']['soundcloud']})\n"
-                if result.get('shazam_url'):
-                    links_text += f"🔵 [Shazam]({result['shazam_url']})\n"
-            
-            if links_text:
-                embed.add_field(
-                    name="🔗 Liens",
-                    value=links_text,
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="🔗 Liens",
-                    value="Aucun lien trouvé",
-                    inline=False
-                )
-            
-            # Ajouter le timecode où la musique a été trouvée
+        # Créer un embed riche avec les résultats
+        embed = discord.Embed(
+            title="🎵 Musique Identifiée !",
+            description=f"**{result['title']}**\npar {result['artist']}",
+            color=discord.Color.green()
+        )
+        
+        # Ajouter l'image de couverture si disponible
+        if result.get('cover_art'):
+            embed.set_thumbnail(url=result['cover_art'])
+        
+        # Ajouter les liens trouvés
+        links_text = ""
+        if 'links' in result and result['links']:
+            if 'youtube' in result['links']:
+                links_text += f"🎥 [YouTube]({result['links']['youtube']})\n"
+            if 'spotify' in result['links']:
+                links_text += f"🎧 [Spotify]({result['links']['spotify']})\n"
+            if 'soundcloud' in result['links']:
+                links_text += f"☁️ [SoundCloud]({result['links']['soundcloud']})\n"
+            if result.get('shazam_url'):
+                links_text += f"🔵 [Shazam]({result['shazam_url']})\n"
+        
+        if links_text:
             embed.add_field(
-                name="⏱️ Trouvé à",
-                value=f"{result['timecode']}s",
-                inline=True
+                name="🔗 Liens",
+                value=links_text,
+                inline=False
             )
+        else:
+            embed.add_field(
+                name="🔗 Liens",
+                value="Aucun lien trouvé",
+                inline=False
+            )
+        
+        # Ajouter le timecode où la musique a été trouvée
+        embed.add_field(
+            name="⏱️ Trouvé à",
+            value=f"{result['timecode']}s",
+            inline=True
+        )
         
         embed.set_footer(text=f"Demandé par {ctx.author.name}")
         
         await status_msg.delete()
-        await target_channel.send(f"Reconnaissance demandée par {ctx.author.mention}", embed=embed)
+        await ctx.send(embed=embed)
         
     except Exception as e:
         await status_msg.edit(content=f"❌ Erreur lors de la reconnaissance : {str(e)}")
